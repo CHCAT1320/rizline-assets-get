@@ -8,6 +8,7 @@ import UnityPy
 import time
 import subprocess
 import platform
+import hashlib
 
 from colorama import init, Fore, Back, Style
 init(autoreset=True)
@@ -114,11 +115,11 @@ def downloadFile(url: str) -> int:
     elif ".acb=" in url:
         save_dir = os.path.join(root_download_dir.split("=")[0], "acb")
         acbId = file_name.split(".acb=")[1]
-        file_name = file_name.split(".acb=")[0]
-        if len(file_name.split(".")) < 3:
-            file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + ".acb"
-        else:
-            file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + "." + file_name.split(".")[2] + ".acb"
+        file_name = file_name.split(".acb=")[0] + ".acb"
+        # if len(file_name.split(".")) < 3:
+        #     file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + ".acb"
+        # else:
+        #     file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + "." + file_name.split(".")[2] + ".acb"
 
     file_full_path = os.path.join(save_dir, file_name)
     
@@ -158,7 +159,7 @@ def getPatchMetadatas(serverVer: str) -> list:
     baseUrl = f"https://rizlineasset.pigeongames.net/versions/{serverVer}/patch_metadata"
     response = requests.get(baseUrl)
     if response.status_code == 200:
-        patchMetadatas = response.text
+        patchMetadatas = response.text.replace("catalog_catalog.json", "").replace("catalog_catalog.hash", "")
         return patchMetadatas.split("\n")
     else:
         if serverVer == "v100_2_0_8_86e2fda4e0":
@@ -274,7 +275,8 @@ def parseLevel():
             
             if obj.type.name == "MonoBehaviour" and data.m_Name == "Default":
                 data = obj.read_typetree()
-                with open("./output/default.json" , "w", encoding="utf-8") as f:
+                hashText = hashlib.sha256(json.dumps(data, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+                with open(f"./output/default_{hashText}.json", "w", encoding="utf-8") as f:
                     formatted_data = json.dumps(
                     data,
                     indent=4,
@@ -282,7 +284,29 @@ def parseLevel():
                     separators=(',', ':'),
                     )
                     f.write(formatted_data)
-                break
+                
+    # 列举所有关卡文件，并选择最新的一个作为最终的关卡信息文件
+    default_files = [f for f in os.listdir("./output") if f.startswith("default_") and f.endswith(".json")]
+    if not default_files:
+        print(Fore.RED + "未找到关卡信息文件")
+        return
+    print(Fore.GREEN + f"找到{len(default_files)}个关卡信息文件，请选择一个作为最终的关卡信息文件：")
+    print(Fore.YELLOW + "输入文件名前的数字编号，或直接按回车选择最新的一个：")
+    for i, file in enumerate(default_files):
+        print(Fore.CYAN + f"{i + 1}. {file}" + Fore.GREEN + f"该文件有{len(json.load(open(os.path.join('./output', file), 'r', encoding='utf-8'))['levels'])}个关卡信息")
+    inputStr = input(Fore.YELLOW + "请输入数字编号：")
+    if inputStr.isdigit():
+        index = int(inputStr) - 1
+        if 0 <= index < len(default_files):
+            selected_file = default_files[index]
+        else:
+            print(Fore.RED + "输入的数字编号无效，已超出范围，默认选择最新的一个文件")
+            selected_file = default_files[-1]
+    # 把选中的文件保存为default.json，覆盖之前的default.json
+    with open(os.path.join("./output", selected_file), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    with open(os.path.join("./output", "default.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False, separators=(',', ': '))
 
 # parseLevel(parseCatalog())
 
@@ -414,10 +438,11 @@ def main():
             break
         allUpdateFile[serverVer] = []
         for item in data:
-            if item.startswith("Android/") and item.endswith(".bundle"):
+            if item.startswith("Android/"):# and item.endswith(".bundle"):
                 allUpdateFile[serverVer].append(item)
         serverVer = data[0]
         allServerVer.append(serverVer)
+    print(Fore.GREEN + f"全部版本号：{allServerVer}")
     # print(Fore.GREEN + str(allServerVer))
     # print(Fore.GREEN + str(allUpdateFile))
     # 计算文件数量
