@@ -293,7 +293,9 @@ def parseLevel():
     print(Fore.GREEN + f"找到{len(default_files)}个关卡信息文件，请选择一个作为最终的关卡信息文件：")
     print(Fore.YELLOW + "输入文件名前的数字编号，或直接按回车选择最新的一个：")
     for i, file in enumerate(default_files):
-        print(Fore.CYAN + f"{i + 1}. {file}" + Fore.GREEN + f"该文件有{len(json.load(open(os.path.join('./output', file), 'r', encoding='utf-8'))['levels'])}个关卡信息")
+        d = json.load(open(os.path.join('./output', file), 'r', encoding='utf-8'))
+        count = len(d['levels']) + len(d.get('discOLevels', []))
+        print(Fore.CYAN + f"{i + 1}. {file}" + Fore.GREEN + f"该文件有{count}个关卡信息")
     inputStr = input(Fore.YELLOW + "请输入数字编号：")
     if inputStr.isdigit():
         index = int(inputStr) - 1
@@ -315,7 +317,7 @@ def outputBundle():
         fileList = json.load(f)
     with open("./output/default.json", "r", encoding="utf-8") as f:
         data = json.load(f)
-        levels = data["levels"]
+        levels = data["levels"] + data.get("discOLevels", [])
     i = 1
     for level in levels:
         # 获取谱面名称和所在类别
