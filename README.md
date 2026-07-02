@@ -6,7 +6,8 @@
 对于.acb的音频文件，需要用到vgmstream-cli转换成wav
 
 https://github.com/vgmstream/vgmstream
-https://github.com/Virace/vgmstream-cli-build
+
+https://github.com/Virace/vgmstream-cli-build(本项目使用)
 
 当前脚本已支持:
 
@@ -32,7 +33,8 @@ By packet capturing the download API of Pigeon Games' server, and utilizing the 
 For .acb audio files, vgmstream-cli is required to convert them to wav format.
 
 https://github.com/vgmstream/vgmstream
-https://github.com/Virace/vgmstream-cli-build
+
+https://github.com/Virace/vgmstream-cli-build((This project uses)
 
 Current script features:
 
