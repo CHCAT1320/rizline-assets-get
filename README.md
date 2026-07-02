@@ -7,7 +7,7 @@
 
 https://github.com/vgmstream/vgmstream
 
-https://github.com/Virace/vgmstream-cli-build(本项目使用)
+https://github.com/Virace/vgmstream-cli-build (本项目使用)
 
 当前脚本已支持:
 
@@ -34,7 +34,7 @@ For .acb audio files, vgmstream-cli is required to convert them to wav format.
 
 https://github.com/vgmstream/vgmstream
 
-https://github.com/Virace/vgmstream-cli-build((This project uses)
+https://github.com/Virace/vgmstream-cli-build (This project uses)
 
 Current script features:
 
