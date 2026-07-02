@@ -9,6 +9,8 @@ import time
 import subprocess
 import platform
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from colorama import init, Fore, Back, Style
 init(autoreset=True)
@@ -51,6 +53,8 @@ def getRizlineVersion() -> dict:
 CHUNK_SIZE = 1024 * 1024  # 分块大小：1MB/块（平衡速度和进度刷新频率）
 PROGRESS_BAR_FIXED_LENGTH = 20  # 进度条固定字符数，可按需调整（如15/25）
 MAX_FILENAME_DISPLAY = 40       # 文件名最大显示长度，超长截断，避免挤压进度条
+MAX_WORKERS = 16                # 并发下载线程数
+print_lock = threading.Lock()   # 并发打印锁，避免输出乱码
 
 def format_file_size(size: int) -> str:
     """格式化文件大小（B/KB/MB/GB），保留2位小数"""
@@ -104,62 +108,69 @@ def single_file_progress(downloaded: int, total: int, file_name: str, start_time
 
 
 # 下载单个文件 ==> 保存到本地
-def downloadFile(url: str) -> int:
+def downloadFile(url: str, session=None, show_progress=True) -> tuple:
     root_download_dir = "./download"
     file_name = url.split("/")[-1]
     save_dir = root_download_dir
     
-    # 分类保存 ==> bundles、acb ==> ./download/bundles、./download/acb
     if url.endswith("bundle"):
         save_dir = os.path.join(root_download_dir, "bundles")
     elif ".acb=" in url:
         save_dir = os.path.join(root_download_dir.split("=")[0], "acb")
         acbId = file_name.split(".acb=")[1]
         file_name = file_name.split(".acb=")[0] + ".acb"
-        # if len(file_name.split(".")) < 3:
-        #     file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + ".acb"
-        # else:
-        #     file_name = file_name.split(".")[0] + "." + acbId + "." + file_name.split(".")[1] + "." + file_name.split(".")[2] + ".acb"
 
     file_full_path = os.path.join(save_dir, file_name)
     
-    # 如果文件存在 ==> 跳过 ==> 且不是catalog文件 ==> 则直接返回
     if os.path.exists(file_full_path) and not file_name.endswith("catalog_catalog.json"):
-        return 0
+        return 0, 0
 
-    try:
-        # 尝试下载文件 retrn 0 ==> 成功 1 ==> 失败
-        response = requests.get(url, timeout=30, stream=True)
-        response.raise_for_status()
-        total_size = int(response.headers.get('Content-Length', 0))
-        start_time = time.time()
-        downloaded_size = 0
-        
-        os.makedirs(save_dir, exist_ok=True)
-        
-        with open(file_full_path, "wb") as f:
-            # iter_content按指定块大小迭代读取，实现流式下载
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:  # 过滤空块（部分服务器会返回空字节块）
-                    f.write(chunk)  # 逐块写入本地文件
-                    downloaded_size += len(chunk)  # 累计已下载字节数
-                    # 每下载一块刷新一次进度条，实现实时更新
-                    single_file_progress(downloaded_size, total_size, file_name, start_time)
-            print()
-        return 0
+    t0 = time.time()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if session:
+                response = session.get(url, timeout=30, stream=True)
+            else:
+                response = requests.get(url, timeout=30, stream=True)
+            response.raise_for_status()
+            total_size = int(response.headers.get('Content-Length', 0))
+            start_time = time.time()
+            downloaded_size = 0
 
-    except requests.exceptions.RequestException as e:
-        # 下载失败 ==> 打印错误信息
-        err_info = f"下载文件 {file_name} 失败，原因：{str(e)}，URL：{url}"
-        print(Fore.RED + err_info)
-        return 1
+            os.makedirs(save_dir, exist_ok=True)
+
+            with open(file_full_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        if show_progress:
+                            single_file_progress(downloaded_size, total_size, file_name, start_time)
+                if show_progress:
+                    print()
+
+            return 0, time.time() - t0
+
+        except requests.exceptions.RequestException as e:
+            if os.path.exists(file_full_path):
+                os.remove(file_full_path)
+            if attempt < max_retries - 1:
+                with print_lock:
+                    print(Fore.YELLOW + f"下载文件 {file_name} 失败，重试 {attempt+2}/{max_retries}，原因：{str(e)}")
+                time.sleep(2 ** attempt)
+            else:
+                with print_lock:
+                    print(Fore.RED + f"下载文件 {file_name} 失败，原因：{str(e)}，URL：{url}")
+                return 1, time.time() - t0
+    return 1, time.time() - t0
 
 # 通过循环获取patchmetadata ==> 获取每个版本更新的内容
 def getPatchMetadatas(serverVer: str) -> list:
     baseUrl = f"https://rizlineasset.pigeongames.net/versions/{serverVer}/patch_metadata"
     response = requests.get(baseUrl)
     if response.status_code == 200:
-        patchMetadatas = response.text.replace("catalog_catalog.json", "").replace("catalog_catalog.hash", "")
+        patchMetadatas = response.content.decode("utf-8").replace("catalog_catalog.json", "").replace("catalog_catalog.hash", "")
         return patchMetadatas.split("\n")
     else:
         if serverVer == "v100_2_0_8_86e2fda4e0":
@@ -267,6 +278,7 @@ def parseCatalog() -> list:
 
 # 解析、解包bundle文件 ==> 导出关卡信息文件
 def parseLevel():
+    os.makedirs("./output", exist_ok=True)
     # 先查找每个bundle ==> 找到关卡信息
     for path in os.listdir("./download/bundles"):
         bundle = UnityPy.load(os.path.join("./download/bundles", path))
@@ -290,20 +302,25 @@ def parseLevel():
     if not default_files:
         print(Fore.RED + "未找到关卡信息文件")
         return
-    print(Fore.GREEN + f"找到{len(default_files)}个关卡信息文件，请选择一个作为最终的关卡信息文件：")
-    print(Fore.YELLOW + "输入文件名前的数字编号，或直接按回车选择最新的一个：")
-    for i, file in enumerate(default_files):
+    file_infos = []
+    for file in default_files:
         d = json.load(open(os.path.join('./output', file), 'r', encoding='utf-8'))
         count = len(d['levels']) + len(d.get('discOLevels', []))
+        file_infos.append((file, count))
+    file_infos.sort(key=lambda x: x[1], reverse=True)
+    print(Fore.GREEN + f"找到{len(file_infos)}个关卡信息文件（按关卡数量降序）：")
+    for i, (file, count) in enumerate(file_infos):
         print(Fore.CYAN + f"{i + 1}. {file}" + Fore.GREEN + f"该文件有{count}个关卡信息")
     inputStr = input(Fore.YELLOW + "请输入数字编号：")
     if inputStr.isdigit():
         index = int(inputStr) - 1
-        if 0 <= index < len(default_files):
-            selected_file = default_files[index]
+        if 0 <= index < len(file_infos):
+            selected_file = file_infos[index][0]
         else:
-            print(Fore.RED + "输入的数字编号无效，已超出范围，默认选择最新的一个文件")
-            selected_file = default_files[-1]
+            print(Fore.RED + "输入的数字编号无效，已超出范围，默认选择第一个文件")
+            selected_file = file_infos[0][0]
+    else:
+        selected_file = file_infos[0][0]
     # 把选中的文件保存为default.json，覆盖之前的default.json
     with open(os.path.join("./output", selected_file), "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -416,6 +433,20 @@ def outputBundle():
 
 #outputBundle()
 
+def _download_base_file(original_url, allServerVer, resourceBaseUrl, session):
+    t0 = time.time()
+    url = original_url.replace("http://rizastcdn.pigeongames.cn/default", resourceBaseUrl + "/" + allServerVer[-1])
+    state, _ = downloadFile(url, session)
+    if state == 0:
+        return 0, time.time() - t0
+    for ver in allServerVer:
+        url = original_url.replace("http://rizastcdn.pigeongames.cn/default", resourceBaseUrl + "/" + ver)
+        state, _ = downloadFile(url, session)
+        if state == 0:
+            return 0, time.time() - t0
+    return 1, time.time() - t0
+
+
 def main():
     # 清空下载目录
     inputStr = input(Fore.YELLOW + "是否清空下载目录？(y/n)")
@@ -459,17 +490,33 @@ def main():
     if inputStr.lower() != "y" and inputStr.lower() != "yes":
         print(Fore.RED + "取消下载")
     else:
-        # 下载更新文件
-        i = 1
+        urls = []
         for serverVer in allServerVer:
             if serverVer not in allUpdateFile:
                 continue
             for item in allUpdateFile[serverVer]:
-                state = downloadFile(rizlineVer["resourceBaseUrl"] + "/" + serverVer + "/" + item)
-                if state == 0:
-                    print(Fore.GREEN + f"下载进度：{i}/{fileCount} {item} 成功")
-                i += 1
-        print(Fore.GREEN + "下载完成")
+                urls.append((rizlineVer["resourceBaseUrl"] + "/" + serverVer + "/" + item, item))
+        completed = 0
+        failed = 0
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(downloadFile, url, session): (url, name) for url, name in urls}
+            for future in as_completed(futures):
+                url, name = futures[future]
+                state, dt = future.result()
+                with print_lock:
+                    completed += 1
+                    if state == 0:
+                        print(Fore.GREEN + f"下载进度：{completed}/{fileCount} {name} 成功 ({dt:.1f}s)")
+                    else:
+                        failed += 1
+                        print(Fore.RED + f"下载进度：{completed}/{fileCount} {name} 失败 ({dt:.1f}s)")
+                if completed % 50 == 0:
+                    print(Fore.CYAN + f"已完成 {completed}/{fileCount}，失败 {failed}")
+        print(Fore.GREEN + f"下载完成，成功 {completed-failed}，失败 {failed}")
         # 导出关卡信息文件
         print(Fore.GREEN + "解析关卡信息文件")
         parseLevel()
@@ -484,24 +531,30 @@ def main():
     if inputStr.lower() != "y" and inputStr.lower() != "yes":
         print(Fore.RED + "取消下载")
     else:
-        i = 1
-        for file in allFile:
-            file = file.replace("http://rizastcdn.pigeongames.cn/default", rizlineVer["resourceBaseUrl"] + "/" + allServerVer[len(allServerVer) - 1])
-            state = downloadFile(file)
-            if state == 0:
-                print(Fore.GREEN + f"下载进度：{i}/{fileCount} {file} 成功")
-            else:
-                for ver in allServerVer :
-                    print(Fore.RED + f"下载进度：{i}/{fileCount} {file} 失败，尝试备用版本" + ver)
-                    file = file.replace("http://rizastcdn.pigeongames.cn/default", rizlineVer["resourceBaseUrl"] + "/" + ver)
-                    state = downloadFile(file)
+        completed = 0
+        failed = 0
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_download_base_file, file, allServerVer, rizlineVer["resourceBaseUrl"], session): file
+                for file in allFile
+            }
+            for future in as_completed(futures):
+                file = futures[future]
+                state, dt = future.result()
+                with print_lock:
+                    completed += 1
                     if state == 0:
-                        print(Fore.GREEN + f"下载进度：{i}/{fileCount} {file} 成功")
-                        break
-                if state != 0:
-                    print(Fore.RED + f"下载进度：{i}/{fileCount} {file} 失败")
-            i += 1
-        print(Fore.GREEN + "下载完成")
+                        print(Fore.GREEN + f"下载进度：{completed}/{fileCount} {file.split('/')[-1]} 成功 ({dt:.1f}s)")
+                    else:
+                        failed += 1
+                        print(Fore.RED + f"下载进度：{completed}/{fileCount} {file.split('/')[-1]} 失败 ({dt:.1f}s)")
+                if completed % 50 == 0:
+                    print(Fore.CYAN + f"已完成 {completed}/{fileCount}，失败 {failed}")
+        print(Fore.GREEN + f"下载完成，成功 {completed-failed}，失败 {failed}")
     # 导出关卡信息文件
     if not os.path.exists("./output/default.json"):
         parseLevel()
