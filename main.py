@@ -1,18 +1,14 @@
 import requests
 import json
 import os
-import base64
 import shutil
-import struct
-import UnityPy
 import time
-import subprocess
-import platform
-import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from colorama import init, Fore, Back, Style
+from colorama import init, Fore, Style
+from unpack import export_all_resources, parse_catalog, parse_level
+
 init(autoreset=True)
 
 # 获取Rizline版本号
@@ -165,30 +161,92 @@ def downloadFile(url: str, session=None, show_progress=True) -> tuple:
                 return 1, time.time() - t0
     return 1, time.time() - t0
 
-# 通过循环获取patchmetadata ==> 获取每个版本更新的内容
-def getPatchMetadatas(serverVer: str) -> list:
-    baseUrl = f"https://rizlineasset.pigeongames.net/versions/{serverVer}/patch_metadata"
-    response = requests.get(baseUrl)
-    if response.status_code == 200:
-        patchMetadatas = response.content.decode("utf-8").replace("catalog_catalog.json", "").replace("catalog_catalog.hash", "")
-        return patchMetadatas.split("\n")
-    else:
-        if serverVer == "v100_2_0_8_86e2fda4e0":
-            print(Fore.GREEN + "获取所有patchmetadata完成")
-            return None
-        print(Fore.RED + "获取patchmetadata失败" + str(response.status_code) + baseUrl)
-        return None
+PATCH_SKIP_NAMES = {"catalog_catalog.json", "catalog_catalog.hash"}
+CATALOG_PLACEHOLDER = "http://rizastcdn.pigeongames.cn/default"
+
+
+def parse_patch_metadata_text(text: str):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or lines[0].startswith("<?xml") or lines[0].startswith("<Error"):
+        return None, []
+    prev_version = lines[0]
+    files = []
+    for line in lines[1:]:
+        if line.startswith("Android/") and line[len("Android/") :]:
+            files.append(line)
+    return prev_version, files
+
+
+def getPatchMetadatas(serverVer: str, resourceBaseUrl: str):
+    baseUrl = f"{resourceBaseUrl}/{serverVer}/patch_metadata"
+    try:
+        response = requests.get(baseUrl, timeout=30)
+    except requests.exceptions.RequestException as e:
+        print(Fore.RED + f"获取patchmetadata失败：{e} {baseUrl}")
+        return None, []
+    if response.status_code != 200:
+        print(Fore.YELLOW + f"patch_metadata 已不可用（{response.status_code}），版本链在 {serverVer} 中断：{baseUrl}")
+        return None, []
+    prev_version, files = parse_patch_metadata_text(response.content.decode("utf-8", errors="replace"))
+    if prev_version is None:
+        print(Fore.YELLOW + f"patch_metadata 内容无效，版本链在 {serverVer} 中断")
+        return None, []
+    return prev_version, files
 
 def readCataLog() -> list:
     with open("./download/catalog_catalog.json", "r", encoding="utf-8") as f:
         catalog = json.load(f)
     downList = []
     for item in catalog["m_InternalIds"]:
-        if item.startswith("http"):
-            if ".acb=" in item:
-                item = item.split(".bundle")[0]
-            downList.append(item)
+        if isinstance(item, str) and item.startswith("http"):
+            downList.append(catalog_relative_path(item))
     return downList
+
+
+def catalog_relative_path(internal_id: str) -> str:
+    rel = internal_id
+    if rel.startswith(CATALOG_PLACEHOLDER + "/"):
+        rel = rel[len(CATALOG_PLACEHOLDER) + 1 :]
+    elif rel.startswith(CATALOG_PLACEHOLDER):
+        rel = rel[len(CATALOG_PLACEHOLDER) :].lstrip("/")
+    if ".acb=" in rel and rel.endswith(".bundle"):
+        rel = rel[: -len(".bundle")]
+    return rel
+
+
+def patch_lookup_keys(rel_path: str):
+    keys = [rel_path]
+    if rel_path.endswith(".bundle"):
+        keys.append(rel_path[: -len(".bundle")])
+    else:
+        keys.append(rel_path + ".bundle")
+    return keys
+
+
+def resolve_file_version(rel_path: str, patch_map: dict, base_version: str):
+    for key in patch_lookup_keys(rel_path):
+        if key in patch_map:
+            return patch_map[key]
+    return base_version
+
+
+def build_download_url(resource_base_url: str, version: str, rel_path: str) -> str:
+    return f"{resource_base_url}/{version}/{rel_path}"
+
+
+def _download_resolved_file(rel_path, patch_map, base_version, all_versions, resource_base_url, session):
+    t0 = time.time()
+    versions = []
+    mapped = resolve_file_version(rel_path, patch_map, base_version)
+    for ver in [mapped] + list(all_versions):
+        if ver and ver not in versions:
+            versions.append(ver)
+    for ver in versions:
+        url = build_download_url(resource_base_url, ver, rel_path)
+        state, _ = downloadFile(url, session, show_progress=False)
+        if state == 0:
+            return 0, time.time() - t0
+    return 1, time.time() - t0
 
 def clearDownload():
     download_path = "./download"
@@ -202,369 +260,128 @@ def clearDownload():
     if os.path.exists(chartInfoPath):
         shutil.rmtree(chartInfoPath)
 
-def parse_unity_catalog(catalog):
-    # base64解码为二进制字节数组
-    def b642bytes(s):
-        return bytearray(base64.b64decode(s))
-
-    # 字节读取器-小端序专用
-    class ByteReader:
-        __slots__ = ['data', 'pos']
-        def __init__(self, data):
-            self.data = data
-            self.pos = 0
-        def read(self, ln):
-            res = self.data[self.pos:self.pos+ln]
-            self.pos += ln
-            return res
-        def read_int32(self):
-            return struct.unpack('<i', self.read(4))[0]
-
-    # 解码三大核心二进制流
-    key_bytes = b642bytes(catalog['m_KeyDataString'])
-    bucket_bytes = b642bytes(catalog['m_BucketDataString'])
-    entry_bytes = b642bytes(catalog['m_EntryDataString'])
-
-    reader = ByteReader(bucket_bytes)
-    bucket_count = reader.read_int32()
-    table = []
-
-    for _ in range(bucket_count):
-        key_pos = reader.read_int32()
-        key_type = key_bytes[key_pos] if key_pos < len(key_bytes) else -1
-        curr_kp = key_pos + 1
-        key_val = None
-
-        # 解析UTF8/UTF16字符串Key | 数字Key
-        if key_type in (0, 1):
-            str_len = key_bytes[curr_kp] if curr_kp < len(key_bytes) else 0
-            curr_kp +=4
-            s_byte = key_bytes[curr_kp : curr_kp+str_len]
-            if key_type == 0:
-                key_val = bytes(s_byte).decode('utf-8', errors='ignore') # UTF8中文
-            else:
-                key_val = bytes(s_byte).decode('utf-16-le', errors='ignore') # UTF16小端中文
-        elif key_type == 4:
-            key_val = key_bytes[curr_kp] if curr_kp < len(key_bytes) else 0
-
-        # 解析Entry数据
-        entry_val = 65535
-        entry_count = reader.read_int32()
-        for _ in range(entry_count):
-            entry_pos = reader.read_int32()
-            entry_start = 4 + 28 * entry_pos
-            e_byte = entry_bytes[entry_start+8 : entry_start+10]
-            entry_val = struct.unpack('<H', bytes(e_byte))[0] if len(e_byte)==2 else 65535
-        
-        table.append([key_val, entry_val])
-
-    # 处理引用关联 替换索引为真实名称
-    for i in range(len(table)):
-        val = table[i][1]
-        if val != 65535 and 0 <= val < len(table):
-            table[i][1] = table[val][0]
-
-    return table
-
-# 解析catalog的m_KeyDataString ==> 获取bundle文件名列表
-def parseCatalog() -> list:
-    with open("./download/catalog_catalog.json", "r", encoding="utf-8") as f:
-        catalog = json.load(f)
-    keyData = parse_unity_catalog(catalog)
-    with open("./download/fileList.json", "w", encoding="utf-8") as f:
-        json.dump(keyData, f, indent=4, ensure_ascii=False, separators=(',', ': '))
-    return keyData
+def _make_session():
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
-# 解析、解包bundle文件 ==> 导出关卡信息文件
-def parseLevel():
-    os.makedirs("./output", exist_ok=True)
-    # 先查找每个bundle ==> 找到关卡信息
-    for path in os.listdir("./download/bundles"):
-        bundle = UnityPy.load(os.path.join("./download/bundles", path))
-        for obj in bundle.objects:
-            data = obj.read()
-            
-            if obj.type.name == "MonoBehaviour" and data.m_Name == "Default":
-                data = obj.read_typetree()
-                hashText = hashlib.sha256(json.dumps(data, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
-                with open(f"./output/default_{hashText}.json", "w", encoding="utf-8") as f:
-                    formatted_data = json.dumps(
-                    data,
-                    indent=4,
-                    ensure_ascii=False,
-                    separators=(',', ':'),
-                    )
-                    f.write(formatted_data)
-                
-    # 列举所有关卡文件，并选择最新的一个作为最终的关卡信息文件
-    default_files = [f for f in os.listdir("./output") if f.startswith("default_") and f.endswith(".json")]
-    if not default_files:
-        print(Fore.RED + "未找到关卡信息文件")
+def _run_downloads(rel_paths, patch_map, base_version, all_versions, resource_base_url, label):
+    file_count = len(rel_paths)
+    if file_count == 0:
+        print(Fore.GREEN + f"{label}无需下载")
         return
-    file_infos = []
-    for file in default_files:
-        d = json.load(open(os.path.join('./output', file), 'r', encoding='utf-8'))
-        count = len(d['levels']) + len(d.get('discOLevels', []))
-        file_infos.append((file, count))
-    file_infos.sort(key=lambda x: x[1], reverse=True)
-    print(Fore.GREEN + f"找到{len(file_infos)}个关卡信息文件（按关卡数量降序）：")
-    for i, (file, count) in enumerate(file_infos):
-        print(Fore.CYAN + f"{i + 1}. {file}" + Fore.GREEN + f"该文件有{count}个关卡信息")
-    inputStr = input(Fore.YELLOW + "请输入数字编号：")
-    if inputStr.isdigit():
-        index = int(inputStr) - 1
-        if 0 <= index < len(file_infos):
-            selected_file = file_infos[index][0]
-        else:
-            print(Fore.RED + "输入的数字编号无效，已超出范围，默认选择第一个文件")
-            selected_file = file_infos[0][0]
-    else:
-        selected_file = file_infos[0][0]
-    # 把选中的文件保存为default.json，覆盖之前的default.json
-    with open(os.path.join("./output", selected_file), "r", encoding="utf-8") as f:
-        data = json.load(f)
-    with open(os.path.join("./output", "default.json"), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False, separators=(',', ': '))
+    completed = 0
+    failed = 0
+    session = _make_session()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _download_resolved_file,
+                rel_path,
+                patch_map,
+                base_version,
+                all_versions,
+                resource_base_url,
+                session,
+            ): rel_path
+            for rel_path in rel_paths
+        }
+        for future in as_completed(futures):
+            rel_path = futures[future]
+            state, dt = future.result()
+            name = rel_path.split("/")[-1]
+            with print_lock:
+                completed += 1
+                if state == 0:
+                    print(Fore.GREEN + f"{label}进度：{completed}/{file_count} {name} 成功 ({dt:.1f}s)")
+                else:
+                    failed += 1
+                    print(Fore.RED + f"{label}进度：{completed}/{file_count} {name} 失败 ({dt:.1f}s)")
+            if completed % 50 == 0:
+                print(Fore.CYAN + f"已完成 {completed}/{file_count}，失败 {failed}")
+    print(Fore.GREEN + f"{label}完成，成功 {completed - failed}，失败 {failed}")
 
-# parseLevel(parseCatalog())
 
-def outputBundle():
-    with open("./download/fileList.json", "r", encoding="utf-8") as f:
-        fileList = json.load(f)
-    with open("./output/default.json", "r", encoding="utf-8") as f:
-        data = json.load(f)
-        levels = data["levels"] + data.get("discOLevels", [])
-    i = 1
-    for level in levels:
-        # 获取谱面名称和所在类别
-        levelId = level["id"]
-        name = levelId.split('.')[0]
-        discName = level["discName"]
-        chartIds = level["chartIds"]
-        illustrationId = level["illustrationId"]
-        musicId = level["musicId"]
-        if not os.path.exists(f"output/charts/{discName}"):
-            os.makedirs(f"output/charts/{discName}")
-        # if os.path.exists(f"./output/charts/{discName}/{name}"):
-        #     print(Fore.RED + f"导出进度：{i}/{len(levels)} {Fore.CYAN}{name} {Fore.RED}失败，已存在相同关卡，为避免重复导出，跳过此关卡")
-        #     i += 1
-        #     continue
-        if not os.path.exists(f"output/charts/{discName}/{name}"):
-            os.makedirs(f"output/charts/{discName}/{name}")
-        # 遍历chartIds ==> 找到对应谱面文件 ==> 导出到本地
-        # 导出谱面文件 ==> charts/discXX/levelXX/chartId.json
-        for chartId in chartIds:
-            for file in fileList:
-                if file[0] == chartId:
-                    bundle = UnityPy.load(os.path.join("./download/bundles", file[1]))
-                    for obj in bundle.objects:
-                        if obj.type.name == "TextAsset":
-                            chartData = obj.read()
-                            with open(f"output/charts/{discName}/{name}/{chartId}.json", "wb") as f:
-                                f.write(chartData.m_Script.encode("utf-8"))
-        # 导出曲绘文件 ==> charts/discXX/levelXX/illustrationId.png
-        for file in fileList:
-            if file[0] == illustrationId:
-                bundle = UnityPy.load(os.path.join("./download/bundles", file[1]))
-                for obj in bundle.objects:
-                    if obj.type.name in ["Texture2D", "Sprite"]:
-                        imgData = obj.read()
-                        path = os.path.join(f"output/charts/{discName}/{name}", illustrationId + ".png")
-                        imgData.image.save(path)
-        # 转换音频文件格式 ==> acb2wav ==> charts/discXX/levelXX/musicId.wav
-        system = platform.system()
-        if system == "Windows":
-            vgcPath = "./vgmstream-cli/vgmstream-cli.exe"
-        else:  # Linux 或 macOS
-            # 优先检查本地目录
-            local_path = "./vgmstream-cli/vgmstream-cli"
-            if os.path.exists(local_path):
-                vgcPath = local_path
-            else:
-                # 尝试从系统 PATH 中查找（如果已全局安装）
-                vgcPath = "vgmstream-cli"  # Linux 通常直接调用命令名
-                if not shutil.which(vgcPath):
-                    raise FileNotFoundError("未找到 vgmstream-cli，请确保已安装或在 ./vgmstream-cli/ 目录下")
+def collect_patch_chain(resource_base_url: str, current_ver: str):
+    all_versions = [current_ver]
+    patch_map = {}
+    base_version = current_ver
+    server_ver = current_ver
+    while True:
+        prev_version, files = getPatchMetadatas(server_ver, resource_base_url)
+        if prev_version is None:
+            print(Fore.GREEN + "已到达当前 CDN 上仍保留的热更新终点")
+            break
+        resource_count = 0
+        for item in files:
+            name = item[len("Android/") :]
+            if name in PATCH_SKIP_NAMES:
+                continue
+            resource_count += 1
+            if item not in patch_map:
+                patch_map[item] = server_ver
+        print(Fore.CYAN + f"{server_ver} 热更新 Android 资源：{resource_count} 个（上一版本 {prev_version}）")
+        base_version = prev_version
+        if prev_version in all_versions:
+            break
+        all_versions.append(prev_version)
+        server_ver = prev_version
+    return all_versions, patch_map, base_version
 
-        acbPath = "./download/acb/"
-        for file in os.listdir(acbPath):
-            if name.lower() == file.split(".")[0]:
-                # 确保输出目录存在
-                output_dir = f"output/charts/{discName}/{name}"
-                os.makedirs(output_dir, exist_ok=True)
-                
-                subprocess.run([
-                    vgcPath,
-                    "-o", os.path.join(output_dir, musicId + ".wav"),
-                    os.path.join(acbPath, file),
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # 导出关卡信息文件 ==> charts/discXX/chartInfojson
-        with open(f"output/charts/{discName}/{name}/chartInfo.json", "w", encoding="utf-8") as f:
-            allChartsList = data["charts"]
-            chartLevel = []
-            for chart in allChartsList:
-                if chart["id"] in chartIds:
-                    difficultyLevel = chart["level"]
-                    difficulty = chart["difficulty"]
-                    designer = chart["designer"]
-                    chartLevel.append({
-                        "difficultyLevel": difficultyLevel,
-                        "difficulty": difficulty,
-                        "designer": designer,
-                    })
-            chartInfo = {
-                "name": name,
-                "levelId": levelId,
-                "discName": discName,
-                "chartIds": chartIds,
-                "illustrationId": illustrationId,
-                "musicId": musicId,
-                "appearType": level["appearType"],
-                "seriesIndex": level["seriesIndex"],
-                "isNewLevel": level["isNewLevel"],
-                "chartLevel": chartLevel,
-            }
-            f.write(json.dumps(chartInfo, indent=4, ensure_ascii=False, separators=(',', ':')))
-
-        print(f"{Fore.GREEN}导出进度：{Fore.YELLOW}{i}/{len(levels)} {Fore.CYAN}{name} {Fore.GREEN}成功")
-        i += 1
-
-#outputBundle()
-
-def _download_base_file(original_url, allServerVer, resourceBaseUrl, session):
-    t0 = time.time()
-    url = original_url.replace("http://rizastcdn.pigeongames.cn/default", resourceBaseUrl + "/" + allServerVer[-1])
-    state, _ = downloadFile(url, session)
-    if state == 0:
-        return 0, time.time() - t0
-    for ver in allServerVer:
-        url = original_url.replace("http://rizastcdn.pigeongames.cn/default", resourceBaseUrl + "/" + ver)
-        state, _ = downloadFile(url, session)
-        if state == 0:
-            return 0, time.time() - t0
-    return 1, time.time() - t0
+def collect_download_list(catalog_files, patch_map):
+    seen = set()
+    ordered = []
+    for rel_path in catalog_files:
+        if rel_path not in seen:
+            seen.add(rel_path)
+            ordered.append(rel_path)
+    for item in patch_map:
+        name = item[len("Android/") :] if item.startswith("Android/") else item
+        if name in PATCH_SKIP_NAMES:
+            continue
+        if item not in seen and name not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
 
 
 def main():
-    # 清空下载目录
     inputStr = input(Fore.YELLOW + "是否清空下载目录？(y/n)")
     if inputStr.lower() != "y" and inputStr.lower() != "yes":
         print(Fore.GREEN + "取消清空")
     else:
         clearDownload()
         print(Fore.GREEN + "清空下载目录完成")
-    # 获取Rizline版本号
     rizlineVer = getRizlineVersion()
     serverVer = rizlineVer["resourceVersion"]
-    allServerVer = [serverVer]
-    allUpdateFile = {}
-    # 下载最早的版本号的catalog.json
-    # downloadFile(rizlineVer["resourceBaseUrl"] + "/v100_2_0_8_86e2fda4e0/Android/catalog_catalog.json")
-    print(rizlineVer["resourceBaseUrl"] + f"/{serverVer}/Android/catalog_catalog.json")
-    downloadFile(rizlineVer["resourceBaseUrl"] + f"/{serverVer}/Android/catalog_catalog.json")
-    allFile = readCataLog()
-    while True:
-        data = getPatchMetadatas(serverVer)
-        if data == None:
-            break
-        allUpdateFile[serverVer] = []
-        for item in data:
-            if item.startswith("Android/"):# and item.endswith(".bundle"):
-                allUpdateFile[serverVer].append(item)
-        serverVer = data[0]
-        allServerVer.append(serverVer)
+    resourceBaseUrl = rizlineVer["resourceBaseUrl"]
+    print(resourceBaseUrl + f"/{serverVer}/Android/catalog_catalog.json")
+    downloadFile(resourceBaseUrl + f"/{serverVer}/Android/catalog_catalog.json")
+    catalog_files = readCataLog()
+    allServerVer, patch_map, base_version = collect_patch_chain(resourceBaseUrl, serverVer)
     print(Fore.GREEN + f"全部版本号：{allServerVer}")
-    # print(Fore.GREEN + str(allServerVer))
-    # print(Fore.GREEN + str(allUpdateFile))
-    # 计算文件数量
-    fileCount = 0
-    for serverVer in allServerVer:
-        if serverVer not in allUpdateFile:
-            continue
-        fileCount += len(allUpdateFile[serverVer])
-    print(Fore.GREEN + f"共需下载{fileCount}个文件")
-    # 询问是否开始下载
-    inputStr = input(Fore.YELLOW + "是否开始下载热更新版本文件？(y/n)")
+    print(Fore.GREEN + f"基线目录 resourceBaseVersion：{base_version}")
+    print(Fore.GREEN + f"热更映射 {len(patch_map)} 条，catalog 远程 {len(catalog_files)} 条")
+    download_list = collect_download_list(catalog_files, patch_map)
+    print(Fore.GREEN + f"共需下载 {len(download_list)} 个远程文件（含热更与基线）")
+    inputStr = input(Fore.YELLOW + "是否开始下载全部远程资源？(y/n)")
     if inputStr.lower() != "y" and inputStr.lower() != "yes":
         print(Fore.RED + "取消下载")
     else:
-        urls = []
-        for serverVer in allServerVer:
-            if serverVer not in allUpdateFile:
-                continue
-            for item in allUpdateFile[serverVer]:
-                urls.append((rizlineVer["resourceBaseUrl"] + "/" + serverVer + "/" + item, item))
-        completed = 0
-        failed = 0
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(downloadFile, url, session): (url, name) for url, name in urls}
-            for future in as_completed(futures):
-                url, name = futures[future]
-                state, dt = future.result()
-                with print_lock:
-                    completed += 1
-                    if state == 0:
-                        print(Fore.GREEN + f"下载进度：{completed}/{fileCount} {name} 成功 ({dt:.1f}s)")
-                    else:
-                        failed += 1
-                        print(Fore.RED + f"下载进度：{completed}/{fileCount} {name} 失败 ({dt:.1f}s)")
-                if completed % 50 == 0:
-                    print(Fore.CYAN + f"已完成 {completed}/{fileCount}，失败 {failed}")
-        print(Fore.GREEN + f"下载完成，成功 {completed-failed}，失败 {failed}")
-        # 导出关卡信息文件
-        print(Fore.GREEN + "解析关卡信息文件")
-        parseLevel()
-        if os.path.exists("./output/default.json"):
-            print(Fore.GREEN + "导出关卡信息文件成功")
-        else:
-            print(Fore.RED + "导出关卡信息文件失败")
-    fileCount = len(allFile)
-    print(Fore.GREEN + f"共需下载{fileCount}个文件")
-    # 询问是否开始下载
-    inputStr = input(Fore.YELLOW + "是否开始下载基础文件？(y/n)")
-    if inputStr.lower() != "y" and inputStr.lower() != "yes":
-        print(Fore.RED + "取消下载")
-    else:
-        completed = 0
-        failed = 0
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(_download_base_file, file, allServerVer, rizlineVer["resourceBaseUrl"], session): file
-                for file in allFile
-            }
-            for future in as_completed(futures):
-                file = futures[future]
-                state, dt = future.result()
-                with print_lock:
-                    completed += 1
-                    if state == 0:
-                        print(Fore.GREEN + f"下载进度：{completed}/{fileCount} {file.split('/')[-1]} 成功 ({dt:.1f}s)")
-                    else:
-                        failed += 1
-                        print(Fore.RED + f"下载进度：{completed}/{fileCount} {file.split('/')[-1]} 失败 ({dt:.1f}s)")
-                if completed % 50 == 0:
-                    print(Fore.CYAN + f"已完成 {completed}/{fileCount}，失败 {failed}")
-        print(Fore.GREEN + f"下载完成，成功 {completed-failed}，失败 {failed}")
-    # 导出关卡信息文件
+        _run_downloads(download_list, patch_map, base_version, allServerVer, resourceBaseUrl, "下载")
     if not os.path.exists("./output/default.json"):
-        parseLevel()
+        parse_level()
     if os.path.exists("./output/default.json"):
         print(Fore.GREEN + "导出关卡信息文件成功")
     else:
         print(Fore.RED + "导出关卡信息文件失败")
         return
-    parseCatalog()
-    outputBundle()
+    parse_catalog()
+    export_all_resources()
     input(Fore.YELLOW + "按任意键退出")
 
 main()
