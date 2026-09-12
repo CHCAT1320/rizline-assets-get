@@ -12,45 +12,71 @@ def parse_level():
         print(Fore.RED + "未找到 bundle 目录")
         return
 
-    for filename in os.listdir(BUNDLES_DIR):
+    candidates = []
+    bundle_files = [
+        filename
+        for filename in os.listdir(BUNDLES_DIR)
+        if filename.endswith(".bundle") and os.path.isfile(os.path.join(BUNDLES_DIR, filename))
+    ]
+    print(Fore.GREEN + f"扫描 {len(bundle_files)} 个 bundle 查找关卡信息", flush=True)
+    for i, filename in enumerate(bundle_files, 1):
+        path = os.path.join(BUNDLES_DIR, filename)
         env = load_bundle(filename)
         if env is None:
             continue
-        for name, tree in extract_typetrees(env, name="Default"):
+        for _name, tree in extract_typetrees(env, name="Default"):
             hash_text = hashlib.sha256(json.dumps(tree, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
-            write_json(os.path.join(OUTPUT_DIR, f"default_{hash_text}.json"), tree)
+            out_name = f"default_{hash_text}.json"
+            write_json(os.path.join(OUTPUT_DIR, out_name), tree)
+            last_id = ""
+            levels = tree.get("levels") or []
+            if levels:
+                last_id = levels[-1].get("id") or ""
+            candidates.append(
+                {
+                    "file": out_name,
+                    "data": tree,
+                    "bundle": filename,
+                    "mtime": os.path.getmtime(path),
+                    "level_count": len(levels) + len(tree.get("discOLevels", [])),
+                    "chart_count": len(tree.get("charts", [])),
+                    "activity_time": tree.get("activityTime") or 0,
+                    "last_id": last_id,
+                    "is_temp": last_id.lower() == "temp",
+                }
+            )
+        if i % 100 == 0 or i == len(bundle_files):
+            print(Fore.CYAN + f"关卡扫描：{i}/{len(bundle_files)}", flush=True)
 
-    default_files = [f for f in os.listdir(OUTPUT_DIR) if f.startswith("default_") and f.endswith(".json")]
-    if not default_files:
+    if not candidates:
         print(Fore.RED + "未找到关卡信息文件")
         return
 
-    file_infos = []
-    for filename in default_files:
-        path = os.path.join(OUTPUT_DIR, filename)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        level_count = len(data.get("levels", [])) + len(data.get("discOLevels", []))
-        chart_count = len(data.get("charts", []))
-        activity_time = data.get("activityTime") or 0
-        mtime = os.path.getmtime(path)
-        file_infos.append((filename, data, level_count, chart_count, activity_time, mtime))
-    file_infos.sort(key=lambda x: (x[2], x[3], x[4], x[5]), reverse=True)
+    newest = {}
+    for item in candidates:
+        current = newest.get(item["file"])
+        if current is None or item["mtime"] > current["mtime"]:
+            newest[item["file"]] = item
+    file_infos = list(newest.values())
+    file_infos.sort(
+        key=lambda x: (x["mtime"], 0 if x["is_temp"] else 1, x["level_count"], x["chart_count"], x["activity_time"]),
+        reverse=True,
+    )
 
-    print(Fore.GREEN + f"找到{len(file_infos)}个关卡信息文件（按最新降序）：")
-    for i, (filename, _data, level_count, chart_count, activity_time, _mtime) in enumerate(file_infos):
+    print(Fore.GREEN + f"找到{len(file_infos)}个关卡信息文件（按来源 bundle 更新时间降序）：")
+    for i, item in enumerate(file_infos):
         print(
             Fore.CYAN
-            + f"{i + 1}. {filename}"
+            + f"{i + 1}. {item['file']}"
             + Fore.GREEN
-            + f" 关卡{level_count} 谱面{chart_count} activityTime={activity_time}"
+            + f" 关卡{item['level_count']} 谱面{item['chart_count']} 末曲={item['last_id']} bundle={item['bundle']}"
         )
-    selected_file, data, level_count, chart_count, activity_time, _mtime = file_infos[0]
+    selected = file_infos[0]
     print(
         Fore.GREEN
-        + f"已自动选择最新关卡文件：{selected_file}（关卡{level_count}，谱面{chart_count}）"
+        + f"已自动选择最新关卡文件：{selected['file']}（关卡{selected['level_count']}，谱面{selected['chart_count']}，末曲={selected['last_id']}）"
     )
-    write_json(DEFAULT_JSON, data)
+    write_json(DEFAULT_JSON, selected["data"])
 
 
 def load_default():

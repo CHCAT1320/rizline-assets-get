@@ -373,8 +373,7 @@ def main():
         print(Fore.RED + "取消下载")
     else:
         _run_downloads(download_list, patch_map, base_version, allServerVer, resourceBaseUrl, "下载")
-    if not os.path.exists("./output/default.json"):
-        parse_level()
+    parse_level()
     if os.path.exists("./output/default.json"):
         print(Fore.GREEN + "导出关卡信息文件成功")
     else:
