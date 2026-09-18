@@ -23,6 +23,10 @@ https://github.com/Virace/vgmstream-cli-build (本项目使用)
 
 6.解包逻辑与下载解耦，资源覆盖重写
 
+## PC 版解包
+
+PC 安装目录的资源是 AES 加密的 bundle，仓库附带独立解包脚本 [`pc/pc_unpack.py`](pc/pc_unpack.py)，用法见 [pc/README.md](pc/README.md)。
+
 20260702：自今日起该项目可能会用到ai辅助编程，下载功能已改为多线程下载，并修复了一些存在问题 by CHCAT1320
 
 QQ:1095216448
@@ -51,6 +55,10 @@ Current script features:
 5. Typed unpack: charts (including .mr / .cn / challenge), illustrations (including HiRes), layouts, series posters/banners, avatars, localization, videos, UI, and acb2wav
 
 6. Unpack is decoupled from download; existing files are overwritten
+
+## PC unpack
+
+PC install bundles are AES encrypted. A standalone unpacker is included at [`pc/pc_unpack.py`](pc/pc_unpack.py); see [pc/README.md](pc/README.md) for usage.
 
 20260702: From today onwards, this project may utilize AI-assisted programming. The download function has been changed to multi-threaded downloading, and several existing issues have been fixed. by CHCAT1320
 
