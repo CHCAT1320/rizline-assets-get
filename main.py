@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from colorama import init, Fore, Style
@@ -103,61 +104,244 @@ def single_file_progress(downloaded: int, total: int, file_name: str, start_time
           end='', flush=True)
 
 
+class MultiProgress:
+    """
+    多行并发进度显示：
+    - 顶部为活跃下载线程各自的一行进度（最多 MAX_WORKERS 行）
+    - 底部为整批总进度条（文件数 + 总字节数）
+    使用 ANSI 光标控制原地重绘，所有更新都在锁内完成，避免多线程串行错乱。
+    """
+
+    def __init__(self, total_files: int, slots: int = MAX_WORKERS):
+        self.total_files = total_files
+        self.slots = slots
+        self.lock = threading.Lock()
+        self.slots_state = {}  # slot_id -> {"name", "downloaded", "total", "start"}
+        self.completed = 0
+        self.failed = 0
+        self.total_bytes = 0
+        self.done_bytes = 0
+        self.batch_start = time.time()
+        self.lines_rendered = 0
+        self.enabled = True
+
+    # 占用一个显示槽位并登记文件信息
+    def start_file(self, slot_id: int, name: str):
+        with self.lock:
+            self.slots_state[slot_id] = {
+                "name": name,
+                "downloaded": 0,
+                "total": 0,
+                "start": time.time(),
+            }
+            self._render()
+
+    # 收到响应头后登记文件总大小（同槽位重试时覆盖，不重复累加）
+    def set_total(self, slot_id: int, total: int):
+        with self.lock:
+            state = self.slots_state.get(slot_id)
+            if state is None:
+                return
+            total = max(total, 0)
+            self.total_bytes += total - state["total"]
+            state["total"] = total
+            self._render()
+
+    # 更新某个文件的已下载字节
+    def update_file(self, slot_id: int, downloaded: int):
+        with self.lock:
+            state = self.slots_state.get(slot_id)
+            if state is None:
+                return
+            state["downloaded"] = downloaded
+            self._render()
+
+    # 结束块内某一槽位（成功或失败），并打印一条独立日志（如失败信息）
+    def print_line(self, text: str):
+        with self.lock:
+            if not self.enabled:
+                print(text, flush=True)
+                return
+            # 光标回到块顶 -> 清空整块 -> 打印日志 -> 在下方重绘块
+            if self.lines_rendered:
+                print(f"\033[{self.lines_rendered}A", end="", flush=True)
+                for i in range(self.lines_rendered):
+                    print("\033[2K", end="", flush=True)
+                    if i < self.lines_rendered - 1:
+                        print("\033[1B", end="", flush=True)
+                print(f"\033[{self.lines_rendered}A", end="", flush=True)
+            print(text, flush=True)
+            self.lines_rendered = 0
+            self._render()
+
+    # 某个文件结束（成功或失败），释放槽位
+    def finish_file(self, slot_id: int, success: bool):
+        with self.lock:
+            state = self.slots_state.pop(slot_id, None)
+            if state is not None:
+                self.done_bytes += state.get("downloaded", 0)
+            self.completed += 1
+            if not success:
+                self.failed += 1
+            self._render()
+
+    def _bar(self, ratio: float, length: int = PROGRESS_BAR_FIXED_LENGTH) -> str:
+        ratio = max(0.0, min(ratio, 1.0))
+        filled = int(length * ratio)
+        arrow = Fore.CYAN + ">" if filled < length else ""
+        filled_str = Fore.MAGENTA + "=" * filled
+        empty = " " * (length - filled - (1 if arrow else 0))
+        return f"[{filled_str}{arrow}{empty}{Fore.WHITE}]"
+
+    @staticmethod
+    def _short_name(name: str) -> str:
+        if len(name) > MAX_FILENAME_DISPLAY:
+            suffix = name[name.rfind('.'):] if '.' in name else ''
+            prefix_len = MAX_FILENAME_DISPLAY - len(suffix) - 3
+            name = f"{name[:prefix_len]}...{suffix}"
+        return f"{name:<{MAX_FILENAME_DISPLAY}}"
+
+    def _render(self):
+        if not self.enabled:
+            return
+        # 已在锁内调用，无需再加锁。
+        # 块高度固定为 slots 个文件行 + 1 个总行，保证光标定位永远准确、终端不滚动。
+        height = self.slots + 1
+        lines = []
+        if self.lines_rendered:
+            lines.append(f"\033[{self.lines_rendered}A")
+
+        for slot_id in range(self.slots):
+            state = self.slots_state.get(slot_id)
+            if state is None:
+                lines.append("\033[K")  # 空槽位：清空整行
+                continue
+            total = state["total"]
+            downloaded = state["downloaded"]
+            ratio = downloaded / total if total > 0 else 0.0
+            elapsed = max(time.time() - state["start"], 0.001)
+            speed = format_file_size(downloaded / elapsed)
+            size_info = (
+                f"{format_file_size(downloaded)}/{format_file_size(total)}"
+                if total > 0
+                else format_file_size(downloaded)
+            )
+            lines.append(
+                f"  {self._short_name(state['name'])} {self._bar(ratio)} "
+                f"{Fore.RED}{ratio:.0%}{Style.RESET_ALL} | {size_info} | "
+                f"{Fore.GREEN}{speed}/s{Style.RESET_ALL}\033[K"
+            )
+
+        total_ratio = self.completed / self.total_files if self.total_files > 0 else 0.0
+        elapsed = max(time.time() - self.batch_start, 0.001)
+        total_speed = format_file_size(self.done_bytes / elapsed)
+        lines.append(
+            Fore.YELLOW
+            + f"总进度 {self.completed}/{self.total_files} {self._bar(total_ratio, 30)} "
+            + f"{total_ratio:.1%} | 失败 {self.failed} | {format_file_size(self.done_bytes)} "
+            + f"| {total_speed}/s"
+            + Style.RESET_ALL
+            + "\033[K"
+        )
+
+        print("\n".join(lines), end="", flush=True)
+        self.lines_rendered = height
+
+    # 结束时收尾：把光标移到块下方并换行，恢复后续正常输出
+    def close(self):
+        with self.lock:
+            if self.enabled and self.lines_rendered:
+                # 光标已停在块顶，下移块高度并换到下一行
+                print(f"\033[{self.lines_rendered}B", end="", flush=True)
+                print()
+            self.enabled = False
+
+
 # 下载单个文件 ==> 保存到本地
-def downloadFile(url: str, session=None, show_progress=True) -> tuple:
+def downloadFile(url: str, session=None, show_progress=True, progress_slot=None) -> tuple:
     root_download_dir = "./download"
     file_name = url.split("/")[-1]
     save_dir = root_download_dir
-    
-    if url.endswith("bundle"):
-        save_dir = os.path.join(root_download_dir, "bundles")
-    elif ".acb=" in url:
-        save_dir = os.path.join(root_download_dir.split("=")[0], "acb")
-        acbId = file_name.split(".acb=")[1]
+    is_catalog = file_name.endswith("catalog_catalog.json")
+
+    # 注意：.acb= 判断必须放在 endswith("bundle") 之前，
+    # 因为 CRI 音频 bundle 的 URL 形如 xxx.acb=3c2b40.bundle，
+    # 若先命中 bundle 分支会被错误地存入 bundles/ 且文件名带 =hash 后缀。
+    if ".acb=" in url:
+        save_dir = os.path.join(root_download_dir, "acb")
         file_name = file_name.split(".acb=")[0] + ".acb"
+    elif url.endswith("bundle"):
+        save_dir = os.path.join(root_download_dir, "bundles")
 
     file_full_path = os.path.join(save_dir, file_name)
-    
-    if os.path.exists(file_full_path) and not file_name.endswith("catalog_catalog.json"):
+
+    # 已存在且非空才视为已完成；0 字节残留一律重下。
+    # catalog 文件每次都强制重下（内容会随版本变化）。
+    if not is_catalog and os.path.exists(file_full_path) and os.path.getsize(file_full_path) > 0:
         return 0, 0
 
     t0 = time.time()
     max_retries = 3
+    tmp_path = file_full_path + ".tmp"
+
+    def log(msg):
+        if progress_slot is not None:
+            progress_slot["progress"].print_line(msg)
+        else:
+            with print_lock:
+                print(msg)
+
     for attempt in range(max_retries):
         try:
             if session:
-                response = session.get(url, timeout=30, stream=True)
+                response = session.get(url, timeout=30, stream=True, headers={"Accept-Encoding": "identity"})
             else:
-                response = requests.get(url, timeout=30, stream=True)
+                response = requests.get(url, timeout=30, stream=True, headers={"Accept-Encoding": "identity"})
             response.raise_for_status()
             total_size = int(response.headers.get('Content-Length', 0))
+            content_encoding = response.headers.get('Content-Encoding', '').strip().lower()
             start_time = time.time()
             downloaded_size = 0
 
+            if progress_slot is not None:
+                progress_slot["progress"].set_total(progress_slot["id"], total_size)
+
             os.makedirs(save_dir, exist_ok=True)
 
-            with open(file_full_path, "wb") as f:
+            # 先写入 .tmp 临时文件，全部下完且校验通过后再原子改名，
+            # 避免截断/中断产生"存在但损坏"的正式文件被后续跳过。
+            with open(tmp_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
-                        if show_progress:
+                        if progress_slot is not None:
+                            progress_slot["progress"].update_file(progress_slot["id"], downloaded_size)
+                        elif show_progress:
                             single_file_progress(downloaded_size, total_size, file_name, start_time)
-                if show_progress:
-                    print()
 
+            # 有 Content-Length 且响应未被压缩时严格校验完整性；不足即视为失败并重试。
+            # 已请求 identity 编码，正常情况下 body 与 Content-Length 一致；
+            # 若服务器仍压缩返回（Content-Encoding 非 identity），则无法用该长度校验。
+            if total_size > 0 and content_encoding in ("", "identity") and downloaded_size != total_size:
+                raise requests.exceptions.ChunkedEncodingError(
+                    f"下载不完整：{downloaded_size}/{total_size} 字节"
+                )
+            if downloaded_size == 0:
+                raise requests.exceptions.ChunkedEncodingError("下载内容为空")
+
+            os.replace(tmp_path, file_full_path)
             return 0, time.time() - t0
 
         except requests.exceptions.RequestException as e:
-            if os.path.exists(file_full_path):
-                os.remove(file_full_path)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
             if attempt < max_retries - 1:
-                with print_lock:
-                    print(Fore.YELLOW + f"下载文件 {file_name} 失败，重试 {attempt+2}/{max_retries}，原因：{str(e)}")
+                log(Fore.YELLOW + f"下载文件 {file_name} 失败，重试 {attempt+2}/{max_retries}，原因：{str(e)}")
                 time.sleep(2 ** attempt)
             else:
-                with print_lock:
-                    print(Fore.RED + f"下载文件 {file_name} 失败，原因：{str(e)}，URL：{url}")
+                log(Fore.RED + f"下载文件 {file_name} 失败，原因：{str(e)}，URL：{url}")
                 return 1, time.time() - t0
     return 1, time.time() - t0
 
@@ -234,7 +418,7 @@ def build_download_url(resource_base_url: str, version: str, rel_path: str) -> s
     return f"{resource_base_url}/{version}/{rel_path}"
 
 
-def _download_resolved_file(rel_path, patch_map, base_version, all_versions, resource_base_url, session):
+def _download_resolved_file(rel_path, patch_map, base_version, all_versions, resource_base_url, session, progress, slot_id):
     t0 = time.time()
     versions = []
     mapped = resolve_file_version(rel_path, patch_map, base_version)
@@ -243,7 +427,7 @@ def _download_resolved_file(rel_path, patch_map, base_version, all_versions, res
             versions.append(ver)
     for ver in versions:
         url = build_download_url(resource_base_url, ver, rel_path)
-        state, _ = downloadFile(url, session, show_progress=False)
+        state, _ = downloadFile(url, session, show_progress=False, progress_slot={"progress": progress, "id": slot_id})
         if state == 0:
             return 0, time.time() - t0
     return 1, time.time() - t0
@@ -273,36 +457,40 @@ def _run_downloads(rel_paths, patch_map, base_version, all_versions, resource_ba
     if file_count == 0:
         print(Fore.GREEN + f"{label}无需下载")
         return
-    completed = 0
     failed = 0
     session = _make_session()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _download_resolved_file,
-                rel_path,
-                patch_map,
-                base_version,
-                all_versions,
-                resource_base_url,
-                session,
-            ): rel_path
-            for rel_path in rel_paths
-        }
-        for future in as_completed(futures):
-            rel_path = futures[future]
-            state, dt = future.result()
-            name = rel_path.split("/")[-1]
-            with print_lock:
-                completed += 1
-                if state == 0:
-                    print(Fore.GREEN + f"{label}进度：{completed}/{file_count} {name} 成功 ({dt:.1f}s)")
-                else:
+    progress = MultiProgress(total_files=file_count, slots=MAX_WORKERS)
+
+    # 用队列预分配显示槽位，保证并发数 == 显示行数（最多 MAX_WORKERS 行）
+    slot_queue = queue.Queue()
+    for slot_id in range(MAX_WORKERS):
+        slot_queue.put(slot_id)
+
+    def worker(rel_path, name):
+        slot_id = slot_queue.get()
+        try:
+            progress.start_file(slot_id, name)
+            state, dt = _download_resolved_file(
+                rel_path, patch_map, base_version, all_versions, resource_base_url, session, progress, slot_id
+            )
+            progress.finish_file(slot_id, state == 0)
+            return state, dt
+        finally:
+            slot_queue.put(slot_id)
+
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {}
+            for rel_path in rel_paths:
+                name = rel_path.split("/")[-1]
+                futures[executor.submit(worker, rel_path, name)] = rel_path
+            for future in as_completed(futures):
+                state, dt = future.result()
+                if state != 0:
                     failed += 1
-                    print(Fore.RED + f"{label}进度：{completed}/{file_count} {name} 失败 ({dt:.1f}s)")
-            if completed % 50 == 0:
-                print(Fore.CYAN + f"已完成 {completed}/{file_count}，失败 {failed}")
-    print(Fore.GREEN + f"{label}完成，成功 {completed - failed}，失败 {failed}")
+    finally:
+        progress.close()
+    print(Fore.GREEN + f"{label}完成，成功 {file_count - failed}，失败 {failed}")
 
 
 def collect_patch_chain(resource_base_url: str, current_ver: str):
