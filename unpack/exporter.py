@@ -5,6 +5,7 @@ from unpack.audio import find_acb
 from unpack.catalog import build_bundle_map
 from unpack.classify import classify_key
 from unpack.exporters import (
+    audit_resources,
     extra_charts_for_level,
     export_catalog_asset,
     export_level_pack,
@@ -43,6 +44,7 @@ def export_all_resources():
 
     stats = Counter()
     skipped_charts = 0
+    export_results = []
     catalog_keys = [(key, bundle_name) for key, bundle_name in bundle_map.items() if classify_key(key)[0] != "skip"]
     print(Fore.GREEN + f"开始导出分类资源 {len(catalog_keys)} 项", flush=True)
     for i, (key, bundle_name) in enumerate(catalog_keys, 1):
@@ -51,6 +53,7 @@ def export_all_resources():
             skipped_charts += 1
             continue
         exported_kind, count = export_catalog_asset(key, bundle_name)
+        export_results.append((key, exported_kind, count))
         if count:
             stats[exported_kind] += count
         else:
@@ -70,6 +73,7 @@ def export_all_resources():
         "series_banner": "系列横幅",
         "series_poster": "系列海报",
         "avatar": "头像",
+        "sticker": "贴纸",
         "banner": "活动Banner图",
         "banner_config": "Banner配置",
         "localization": "本地化",
@@ -88,3 +92,5 @@ def export_all_resources():
         for k, v in failed.items():
             print(Fore.YELLOW + f"    {k}: {v}")
     print(Fore.GREEN + f"已随关卡导出的谱面：{skipped_charts}")
+
+    audit_resources(data, bundle_map, used_acb, assigned_charts, export_results, levels)

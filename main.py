@@ -162,15 +162,12 @@ class MultiProgress:
             if not self.enabled:
                 print(text, flush=True)
                 return
-            # 光标回到块顶 -> 清空整块 -> 打印日志 -> 在下方重绘块
+            # 光标位于块顶：用 \033[J 清掉整块，在该位置打印日志，再在下方重绘块
+            parts = []
             if self.lines_rendered:
-                print(f"\033[{self.lines_rendered}A", end="", flush=True)
-                for i in range(self.lines_rendered):
-                    print("\033[2K", end="", flush=True)
-                    if i < self.lines_rendered - 1:
-                        print("\033[1B", end="", flush=True)
-                print(f"\033[{self.lines_rendered}A", end="", flush=True)
-            print(text, flush=True)
+                parts.append("\033[J")
+            parts.append(text + "\n")
+            print("".join(parts), end="", flush=True)
             self.lines_rendered = 0
             self._render()
 
@@ -205,17 +202,11 @@ class MultiProgress:
         if not self.enabled:
             return
         # 已在锁内调用，无需再加锁。
-        # 块高度固定为 slots 个文件行 + 1 个总行，保证光标定位永远准确、终端不滚动。
-        height = self.slots + 1
-        lines = []
-        if self.lines_rendered:
-            lines.append(f"\033[{self.lines_rendered}A")
-
-        for slot_id in range(self.slots):
-            state = self.slots_state.get(slot_id)
-            if state is None:
-                lines.append("\033[K")  # 空槽位：清空整行
-                continue
+        # 只渲染「活跃文件行 + 1 个总行」，块高度随活跃下载数动态变化，
+        # 不再用空行占位，避免文件数不足 16 个时出现大片空白。
+        body = []
+        for slot_id in sorted(self.slots_state.keys()):
+            state = self.slots_state[slot_id]
             total = state["total"]
             downloaded = state["downloaded"]
             ratio = downloaded / total if total > 0 else 0.0
@@ -226,34 +217,48 @@ class MultiProgress:
                 if total > 0
                 else format_file_size(downloaded)
             )
-            lines.append(
+            body.append(
                 f"  {self._short_name(state['name'])} {self._bar(ratio)} "
                 f"{Fore.RED}{ratio:.0%}{Style.RESET_ALL} | {size_info} | "
-                f"{Fore.GREEN}{speed}/s{Style.RESET_ALL}\033[K"
+                f"{Fore.GREEN}{speed}/s{Style.RESET_ALL}"
             )
 
         total_ratio = self.completed / self.total_files if self.total_files > 0 else 0.0
         elapsed = max(time.time() - self.batch_start, 0.001)
         total_speed = format_file_size(self.done_bytes / elapsed)
-        lines.append(
+        body.append(
             Fore.YELLOW
             + f"总进度 {self.completed}/{self.total_files} {self._bar(total_ratio, 30)} "
             + f"{total_ratio:.1%} | 失败 {self.failed} | {format_file_size(self.done_bytes)} "
             + f"| {total_speed}/s"
             + Style.RESET_ALL
-            + "\033[K"
         )
 
-        print("\n".join(lines), end="", flush=True)
+        height = len(body)
+        # 不变量：调用 _render 时光标已位于块顶（第一行行首）。
+        # 因此这里不再上移，直接原地重写；最后一行不输出多余换行，避免触发终端滚动造成光标漂移。
+        parts = []
+        for i, line in enumerate(body):
+            parts.append(line)
+            parts.append("\033[K")  # 清除该行残留
+            if i < height - 1:
+                parts.append("\n")
+        parts.append("\033[J")  # 清除块下方残留的旧行（块变矮时擦掉多余行）
+        if height > 1:
+            parts.append(f"\033[{height - 1}A")  # 回到块顶
+        parts.append("\r")  # 回到行首
+        print("".join(parts), end="", flush=True)
         self.lines_rendered = height
 
     # 结束时收尾：把光标移到块下方并换行，恢复后续正常输出
     def close(self):
         with self.lock:
             if self.enabled and self.lines_rendered:
-                # 光标已停在块顶，下移块高度并换到下一行
-                print(f"\033[{self.lines_rendered}B", end="", flush=True)
+                # 光标停在块顶，下移到块的最后一行再换行
+                if self.lines_rendered > 1:
+                    print(f"\033[{self.lines_rendered - 1}B", end="", flush=True)
                 print()
+            self.lines_rendered = 0
             self.enabled = False
 
 

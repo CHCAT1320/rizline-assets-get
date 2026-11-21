@@ -21,6 +21,8 @@ def classify_key(key: str) -> tuple:
         return ("series_poster", os.path.join("series", "posters", safe_filename(key) + ".png"))
     if key.startswith("avatar."):
         return ("avatar", os.path.join("avatars", safe_filename(key) + ".png"))
+    if key.startswith("sticker."):
+        return ("sticker", os.path.join("stickers", safe_filename(key) + ".png"))
     if key.startswith("banner."):
         if key == "banner.bannerList":
             return ("banner_config", os.path.join("banners", "bannerList.json"))
