@@ -272,24 +272,55 @@ def export_bundle_contents(bundle_name, dest_dir):
         return 0
 
 
+def _dest_newest_mtime(dest_dir):
+    newest = 0
+    for root, _dirs, files in os.walk(dest_dir):
+        for name in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                pass
+    return newest
+
+
 def export_remaining_bundles(used_bundles):
+    """
+    导出没有被地址键引用的 bundle（依赖包 / UI 预制体 / 无别名包）到 output/bundles_misc/。
+    - used_bundles: 已被地址键使用的 bundle 文件名集合
+    - 若目标目录已存在且比 bundle 新，则跳过；bundle 更新时清空旧目录后重导，避免残留。
+    返回 (exported, unchanged, empty)。
+    """
+    from colorama import Fore
+    import shutil
+
     if not os.path.isdir(BUNDLES_DIR):
-        return 0, 0
+        return 0, 0, 0
     used = {os.path.basename(name) for name in used_bundles if name}
     leftover_dir = ensure_dir(os.path.join(OUTPUT_DIR, "bundles_misc"))
+    candidates = sorted(
+        f for f in os.listdir(BUNDLES_DIR)
+        if f.endswith(".bundle") and f not in used and os.path.isfile(os.path.join(BUNDLES_DIR, f))
+    )
+    total = len(candidates)
     exported = 0
+    unchanged = 0
     empty = 0
-    for filename in os.listdir(BUNDLES_DIR):
-        path = os.path.join(BUNDLES_DIR, filename)
-        if not filename.endswith(".bundle") or filename in used or not os.path.isfile(path):
-            continue
+    for i, filename in enumerate(candidates, 1):
+        bundle_path = os.path.join(BUNDLES_DIR, filename)
         dest = os.path.join(leftover_dir, filename.replace(".bundle", ""))
-        count = export_bundle_contents(filename, dest)
-        if count:
-            exported += 1
+        if os.path.isdir(dest) and _dest_newest_mtime(dest) >= os.path.getmtime(bundle_path):
+            unchanged += 1
         else:
-            empty += 1
-    return exported, empty
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            count = export_bundle_contents(filename, dest)
+            if count:
+                exported += 1
+            else:
+                empty += 1
+        if i % 50 == 0 or i == total:
+            print(Fore.CYAN + f"补充导出 bundle：{i}/{total}", flush=True)
+    return exported, unchanged, empty
 
 
 def export_remaining_audio(used_acb_names):

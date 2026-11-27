@@ -10,6 +10,7 @@ from unpack.exporters import (
     export_catalog_asset,
     export_level_pack,
     export_remaining_audio,
+    export_remaining_bundles,
 )
 from unpack.levels import all_levels, load_default
 
@@ -64,6 +65,14 @@ def export_all_resources():
     print(Fore.GREEN + "开始转换未进关卡的音频", flush=True)
     leftover_audio, failed_audio = export_remaining_audio(used_acb)
 
+    print(Fore.GREEN + "开始补导出未参与分类的 bundle", flush=True)
+    used_bundles = {
+        os.path.basename(name)
+        for name in bundle_map.values()
+        if isinstance(name, str) and name.endswith(".bundle")
+    }
+    leftover_bundles, unchanged_bundles, empty_bundles = export_remaining_bundles(used_bundles)
+
     print(Fore.GREEN + "分类资源导出完成：")
     labels = {
         "chart": "额外谱面",
@@ -84,6 +93,7 @@ def export_all_resources():
         if stats[kind]:
             print(Fore.CYAN + f"  {label}: {stats[kind]}")
     print(Fore.CYAN + f"  其余音频: {leftover_audio}")
+    print(Fore.CYAN + f"  补充导出 bundle: {leftover_bundles}（未变 {unchanged_bundles}，空 {empty_bundles}）")
     failed = {k: v for k, v in stats.items() if k.endswith("_failed") and v}
     if failed_audio:
         failed["audio_failed"] = failed_audio
